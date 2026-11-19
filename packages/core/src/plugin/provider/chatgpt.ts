@@ -31,6 +31,10 @@ const providerID = Provider.ID.openai
 const integrationID = Integration.ID.make("openai")
 const methodID = Integration.MethodID.make("chatgpt-token-sharing")
 const modelCacheKey = (clientID: string) => `models:${clientID}`
+// Logout deletes the credential before anything else sees it, so keep each session's latest token to revoke after.
+// The plugin performs every refresh, so it sees each rotated token. Every location runs its own instance of this
+// plugin; sharing one map lets them all follow whichever refreshed, and only the first to see a removal revokes.
+const sessions = new Map<Credential.ID, Credential.OAuth>()
 const fallbackModels = new Set([
   "gpt-5.5",
   "gpt-5.5-fast",
@@ -245,9 +249,6 @@ export const ChatGPTPlugin = define({
       return !Equal.equals(previous, source)
     })
 
-    // Logout deletes the credential before anything else sees it, so keep each session's latest token to revoke after.
-    // The plugin performs every refresh, so it also sees each rotated refresh token.
-    const sessions = new Map<Credential.ID, Credential.OAuth>()
     const method = signIn(
       ctx.app,
       () => Option.getOrUndefined(decodeMetadata(chatgpt?.metadata))?.clientID,
