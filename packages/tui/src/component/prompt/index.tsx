@@ -95,6 +95,13 @@ export type PromptRef = {
   blur(): void
   focus(): void
   submit(): void
+  /** Inserts text at the cursor and returns a handle that can rewrite exactly what it inserted. */
+  insert(text: string): PromptInsertion | undefined
+}
+
+export type PromptInsertion = {
+  /** Replaces the text this insertion wrote. Returns false once the prompt is gone. */
+  update(text: string): boolean
 }
 
 const DRAFT_RETENTION_MIN_CHARS = 20
@@ -180,6 +187,14 @@ function argumentSlash(input: string, commands: readonly KeymapCommand[]) {
   )
   if (!command) return
   return { command, input: head.arguments }
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" })
+
+function countGraphemes(text: string) {
+  let count = 0
+  for (const _ of graphemeSegmenter.segment(text)) count++
+  return count
 }
 
 export function Prompt(props: PromptProps) {
@@ -700,6 +715,31 @@ export function Prompt(props: PromptProps) {
     },
     submit() {
       void submit()
+    },
+    insert(text) {
+      if (disabled() || !input || input.isDestroyed) return
+      const start = input.cursorOffset
+      // The cursor moves in display-width units (measure), but deletion removes one
+      // grapheme at a time, so track both: a wide emoji is 2 columns and 1 grapheme.
+      let width = 0
+      let graphemes = 0
+      const write = (next: string) => {
+        if (!input || input.isDestroyed) return false
+        // Re-anchor at the end of our span, remove it, then write the replacement.
+        input.cursorOffset = start + width
+        for (let i = 0; i < graphemes; i++) input.deleteCharBackward()
+        input.insertText(next)
+        width = measure(next)
+        graphemes = countGraphemes(next)
+        setTimeout(() => {
+          if (!input || input.isDestroyed) return
+          input.invalidateIntrinsicSize()
+          renderer.requestRender()
+        }, 0)
+        return true
+      }
+      write(text)
+      return { update: write }
     },
   }
 

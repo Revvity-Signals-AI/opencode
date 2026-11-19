@@ -31,6 +31,7 @@ import { useStorage } from "../context/storage"
 import { useSessionTabs } from "../context/session-tabs"
 import { useOptionalPanel } from "../context/panel"
 import { useLocal } from "../context/local"
+import { usePromptRef } from "../context/prompt"
 import { abbreviateHome } from "../util/path-format"
 
 export type Dispose = () => Promise<void>
@@ -82,6 +83,7 @@ export function usePluginHost() {
     sessionTabs: useSessionTabs(),
     panel: useOptionalPanel(),
     local: useLocal(),
+    prompt: usePromptRef(),
   }
 }
 
@@ -204,6 +206,16 @@ export function createPluginContext(input: {
     ui: {
       dialog: dialogApi,
       toast: toastApi,
+      prompt: {
+        available: () => host.prompt.current !== undefined,
+        focused: () => host.prompt.current?.focused ?? false,
+        text: () => host.prompt.current?.current.text ?? "",
+        insert(text) {
+          const insertion = host.prompt.current?.insert(text)
+          if (!insertion) return
+          return { update: (next) => insertion.update(next) }
+        },
+      },
       format: {
         path: (value) => abbreviateHome(value, host.paths.home),
       },

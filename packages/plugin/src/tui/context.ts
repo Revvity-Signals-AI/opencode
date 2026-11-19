@@ -487,8 +487,26 @@ export interface Keymap {
   }
 }
 
+export interface PromptInsertion {
+  /** Replaces exactly the text this insertion wrote, e.g. a refined dictation transcript. Returns false once the prompt is gone. */
+  update(text: string): boolean
+}
+
+export interface Prompt {
+  /** Whether a prompt is mounted and accepting input. */
+  available(): boolean
+  /** Whether the prompt input currently has keyboard focus. */
+  focused(): boolean
+  /** The prompt's current plain text, or an empty string when no prompt is mounted. */
+  text(): string
+  /** Inserts text at the prompt cursor without submitting. Returns undefined when no prompt accepts input. */
+  insert(text: string): PromptInsertion | undefined
+}
+
 export interface UI {
   readonly dialog: Dialog
+  /** The active session or home prompt composer. */
+  readonly prompt: Prompt
   readonly toast: Toast
   readonly format: {
     path(value: string): string
