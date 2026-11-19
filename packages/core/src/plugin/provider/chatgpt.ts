@@ -2,10 +2,11 @@ import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { define } from "@opencode/plugin/effect/plugin"
 // import { Deferred, Duration, Effect, Option, Schema, Semaphore, Stream } from "effect"
-import { Deferred, Effect, Equal, Option, Schema, Semaphore } from "effect"
+import { Deferred, Effect, Equal, Option, Schedule, Schema, Semaphore, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import type { Server, ServerResponse } from "node:http"
 import { App } from "../../app.js"
+import { Bus } from "../../bus.js"
 import { Credential } from "../../credential.js"
 import { Integration } from "../../integration.js"
 // import { IntegrationConnection } from "../../integration/connection.js"
@@ -224,6 +225,7 @@ export const ChatGPTPlugin = define({
   id: "opencode.provider.chatgpt",
   effect: Effect.fn(function* (ctx) {
     const credentials = yield* Credential.Service
+    const bus = yield* Bus.Service
     const loading = Semaphore.makeUnsafe(1)
     let chatgpt: Credential.OAuth | undefined
     // let available: ReadonlyArray<RemoteModel> | undefined
@@ -243,10 +245,26 @@ export const ChatGPTPlugin = define({
       return !Equal.equals(previous, source)
     })
 
+    // Logout deletes the credential before anything else sees it, so keep each session's latest token to revoke after.
+    // The plugin performs every refresh, so it also sees each rotated refresh token.
+    const sessions = new Map<Credential.ID, Credential.OAuth>()
+    const method = signIn(
+      ctx.app,
+      () => Option.getOrUndefined(decodeMetadata(chatgpt?.metadata))?.clientID,
+      ctx.storage,
+    )
     yield* ctx.integration.transform((editor) => {
-      editor.method.update(
-        signIn(ctx.app, () => Option.getOrUndefined(decodeMetadata(chatgpt?.metadata))?.clientID, ctx.storage),
-      )
+      editor.method.update({
+        ...method,
+        refresh: (value) =>
+          method.refresh(value).pipe(
+            Effect.tap((next) =>
+              Effect.sync(() => {
+                for (const [id, session] of sessions) if (session.refresh === value.refresh) sessions.set(id, next)
+              }),
+            ),
+          ),
+      })
     })
     yield* Effect.forEach(
       yield* credentials.list(Integration.ID.make("openai")),
@@ -269,6 +287,22 @@ export const ChatGPTPlugin = define({
       { discard: true },
     )
     yield* load()
+    const track = Effect.fn("ChatGPTPlugin.track")(function* (id: Credential.ID) {
+      const stored = (yield* credentials.get(id))?.value
+      if (stored?.type === "oauth" && stored.methodID === methodID) return void sessions.set(id, stored)
+      const session = sessions.get(id)
+      if (!session || stored) return
+      sessions.delete(id)
+      yield* revoke(session, ctx.app).pipe(
+        Effect.catch((cause) => Effect.logWarning("ChatGPT logout was not confirmed by OpenAI", { cause })),
+      )
+    })
+    yield* Effect.forEach(yield* credentials.list(integrationID), (entry) => track(entry.id), { discard: true })
+    yield* bus.subscribe(Credential.Event.Updated).pipe(
+      Stream.filter((event) => event.data.integrationID === integrationID),
+      Stream.runForEach((event) => track(event.data.credentialID)),
+      Effect.forkScoped({ startImmediately: true }),
+    )
     yield* ctx.session.hook(
       "retry",
       (event) =>
@@ -416,6 +450,49 @@ function refresh(value: Credential.OAuth, app: App.Info) {
   })
 }
 
+// Revokes the refresh token so OpenAI ends the session; already-invalid tokens also answer 200.
+export function revoke(
+  value: Credential.OAuth,
+  app: App.Info,
+  discovery = `${issuer}/.well-known/openid-configuration`,
+) {
+  return Effect.gen(function* () {
+    const metadata = Option.getOrUndefined(decodeMetadata(value.metadata))
+    if (!metadata) return yield* Effect.fail(new Error("This ChatGPT connection has no registered client ID."))
+    yield* Effect.gen(function* () {
+      const config = yield* request<{ revocation_endpoint?: string }>(discovery, {
+        headers: { "User-Agent": App.useragent(app) },
+      })
+      if (!config.revocation_endpoint) return yield* Effect.fail(new Error("OpenAI has no revocation endpoint."))
+      const endpoint = config.revocation_endpoint
+      yield* Effect.tryPromise({
+        try: async (signal) => {
+          const response = await fetch(endpoint, {
+            method: "POST",
+            headers: headers(app),
+            body: new URLSearchParams({
+              token: value.refresh,
+              token_type_hint: "refresh_token",
+              client_id: metadata.clientID,
+            }).toString(),
+            signal,
+          })
+          if (!response.ok) throw new StatusError(response.status)
+        },
+        catch: (cause) => cause,
+      })
+    }).pipe(
+      Effect.timeout("10 seconds"),
+      // Retry network failures and 5xx; a 4xx will not change on retry.
+      Effect.retry({
+        times: 2,
+        schedule: Schedule.exponential("250 millis"),
+        while: (error) => !(error instanceof StatusError) || error.status >= 500,
+      }),
+    )
+  })
+}
+
 export function fetchModels(token: string, app: App.Info, baseURL = resource) {
   return Effect.gen(function* () {
     const http = HttpClient.filterStatusOk(yield* HttpClient.HttpClient)
@@ -490,11 +567,17 @@ export function verifyIDToken(
   })
 }
 
+class StatusError extends Error {
+  constructor(readonly status: number) {
+    super(`Request failed: ${status}`)
+  }
+}
+
 function request<A>(url: string, init: RequestInit) {
   return Effect.tryPromise({
     try: async (signal) => {
       const response = await fetch(url, { ...init, signal })
-      if (!response.ok) throw new Error(`Request failed: ${response.status}`)
+      if (!response.ok) throw new StatusError(response.status)
       return response.json() as Promise<A>
     },
     catch: (cause) => cause,
